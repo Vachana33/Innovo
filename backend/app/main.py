@@ -10,6 +10,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",  # local frontend
         # Render frontend URL will be added later
+        "https://innovo-5kis.onrender.com"
     ],
     allow_credentials=True,
     allow_methods=["*"],
