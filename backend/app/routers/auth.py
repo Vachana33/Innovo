@@ -7,7 +7,8 @@ from app.utils import hash_password, verify_password
 from app.jwt_utils import create_access_token
 from app.dependencies import get_db
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(tags=["auth"])
+
 
 
 @router.post("/login", response_model=TokenResponse)
