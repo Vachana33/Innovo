@@ -1,123 +1,67 @@
-from __future__ import annotations
-
-import mimetypes
-import os
-from dataclasses import dataclass
-from typing import Optional, Tuple
-
-from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
+from typing import Tuple
+from fastapi import HTTPException
+from typing import Optional
 
-from app.models import File as FileModel
-from app.storage.file_hash import sha256_hex
-from app.storage.supabase_client import get_bucket_name, get_supabase_client
+from app.models import File
+from app.storage.file_hash import compute_file_hash
+from app.storage.supabase_client import get_supabase_client
+import os
 
-
-@dataclass(frozen=True)
-class StoredFileResult:
-    file: FileModel
-    is_new: bool
-
-
-def _safe_ext(filename: Optional[str]) -> str:
-    """
-    Returns a safe extension without dot, fallback to 'bin'.
-    """
-    if not filename:
-        return "bin"
-    _, ext = os.path.splitext(filename)
-    ext = ext.lower().lstrip(".")
-    return ext if ext else "bin"
-
-
-def _infer_mime(filename: Optional[str], fallback: str = "application/octet-stream") -> str:
-    if not filename:
-        return fallback
-    mime, _ = mimetypes.guess_type(filename)
-    return mime or fallback
-
-
-def _build_storage_path(file_type: str, content_hash: str, filename: Optional[str]) -> str:
-    """
-    Stable path derived from hash.
-    Example: pdf/ab/<hash>.pdf
-    """
-    prefix = content_hash[:2]
-    ext = _safe_ext(filename)
-    return f"{file_type}/{prefix}/{content_hash}.{ext}"
+BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "files")
 
 
 def get_or_create_file(
     db: Session,
-    *,
     file_bytes: bytes,
-    file_type: str,
-    filename: Optional[str],
-) -> StoredFileResult:
+    mime_type: str,
+    original_filename: Optional[str] = None
+) -> Tuple[File, bool]:
     """
-    Global dedup rule:
-      - Same content (same SHA-256) => reuse existing DB row + storage object.
-      - Otherwise upload once and create DB row.
-
-    Raises:
-      - HTTPException(413) if file is too large / storage rejects payload
-      - HTTPException(500) for storage failures
+    GLOBAL FILE INGESTION SPINE
     """
-    content_hash = sha256_hex(file_bytes)
 
-    existing = (
-        db.query(FileModel)
-        .filter(FileModel.content_hash == content_hash)
-        .first()
-    )
-    if existing:
-        return StoredFileResult(file=existing, is_new=False)
-
-    storage_path = _build_storage_path(file_type, content_hash, filename)
-    mime_type = _infer_mime(filename)
+    content_hash = compute_file_hash(file_bytes)
     size_bytes = len(file_bytes)
 
-    # Upload to Supabase Storage
+    existing = db.query(File).filter(File.content_hash == content_hash).first()
+    if existing:
+        return existing, False
+
+    # Derive file_type from mime_type
+    if mime_type.startswith("audio/"):
+        file_type = "audio"
+    elif mime_type == "application/pdf":
+        file_type = "pdf"
+    elif mime_type in {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/msword",
+    }:
+        file_type = "docx"
+    else:
+        file_type = "binary"
+
+    prefix = content_hash[:2]
+    storage_path = f"{file_type}/{prefix}/{content_hash}"
+
     supabase = get_supabase_client()
-    bucket = get_bucket_name()
+    supabase.storage.from_(BUCKET).upload(
+        path=storage_path,
+        file=file_bytes,
+        file_options={"content-type": mime_type},
+    )
 
-    try:
-        # If object already exists, Supabase may throw conflict; we treat it as OK.
-        # We still create DB row because DB is our index.
-        supabase.storage.from_(bucket).upload(
-            path=storage_path,
-            file=file_bytes,
-            file_options={"content-type": mime_type},
-        )
-    except Exception as e:
-        msg = str(e).lower()
-        # Handle 413 / payload too large from storage/proxy
-        if "413" in msg or "payload too large" in msg or "too large" in msg:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail="File too large for upload.",
-            )
-        # Handle "already exists" style conflicts
-        if "already exists" in msg or "duplicate" in msg or "conflict" in msg:
-            # Treat as success; object is there.
-            pass
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Storage upload failed: {str(e)}",
-            )
-
-    new_file = FileModel(
+    new_file = File(
         content_hash=content_hash,
         file_type=file_type,
+        mime_type=mime_type,
         storage_path=storage_path,
         size_bytes=size_bytes,
-        mime_type=mime_type,
-        original_filename=filename,
+        original_filename=original_filename,
     )
 
     db.add(new_file)
     db.commit()
     db.refresh(new_file)
 
-    return StoredFileResult(file=new_file, is_new=True)
+    return new_file, True

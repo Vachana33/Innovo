@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy.orm import Session
 
@@ -13,33 +11,29 @@ router = APIRouter(prefix="/files", tags=["files"])
 
 @router.post("/upload", response_model=FileUploadResponse)
 async def upload_file(
-    file_type: str,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Protected upload endpoint.
-    - Receives multipart file
-    - Dedups by SHA-256
-    - Uploads to Supabase Storage only once
+    Protected global file upload endpoint.
     """
     file_bytes = await file.read()
 
-    result = get_or_create_file(
-        db,
+    file_obj, is_new = get_or_create_file(
+        db=db,
         file_bytes=file_bytes,
-        file_type=file_type,
-        filename=file.filename,
+        mime_type=file.content_type or "application/octet-stream",
+        original_filename=file.filename,
     )
 
     return FileUploadResponse(
-        file_id=result.file.id,
-        content_hash=result.file.content_hash,
-        file_type=result.file.file_type,
-        storage_path=result.file.storage_path,
-        size_bytes=result.file.size_bytes,
-        mime_type=result.file.mime_type,
-        original_filename=result.file.original_filename,
-        reused=not result.is_new,
+        file_id=file_obj.id,
+        content_hash=file_obj.content_hash,
+        file_type=file_obj.file_type,
+        storage_path=file_obj.storage_path,
+        size_bytes=file_obj.size_bytes,
+        mime_type=file_obj.mime_type,
+        original_filename=file_obj.original_filename,
+        reused=not is_new,
     )
